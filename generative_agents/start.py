@@ -135,7 +135,44 @@ def get_config_from_log(checkpoints_folder):
 
 
 # 为新游戏创建配置
-def get_config(start_time="20240213-09:30", stride=15, agents=None):
+def get_config(start_time="20240213-09:30", stride=15, agents_file_path=None):
+    global personas  # Ensure we are using the global personas list
+
+    agents_for_simulation = []
+
+    if agents_file_path:
+        try:
+            with open(agents_file_path, "r", encoding="utf-8") as f:
+                agent_names_from_file = json.load(f)
+            if not isinstance(agent_names_from_file, list):
+                print(f"Error: Content of --agents_file '{agents_file_path}' is not a list. Exiting.")
+                exit(1)
+
+            valid_agent_found = False
+            for name in agent_names_from_file:
+                if name in personas:
+                    agents_for_simulation.append(name)
+                    valid_agent_found = True
+                else:
+                    print(f"Warning: Agent name '{name}' from '{agents_file_path}' is not in the recognized personas list and will be skipped.")
+
+            if not valid_agent_found:
+                print(f"Error: No valid agent names found in '{agents_file_path}' that match recognized personas. Exiting.")
+                exit(1)
+
+        except FileNotFoundError:
+            print(f"Error: --agents_file '{agents_file_path}' not found. Exiting.")
+            exit(1)
+        except json.JSONDecodeError:
+            print(f"Error: --agents_file '{agents_file_path}' contains invalid JSON. Exiting.")
+            exit(1)
+    else:
+        agents_for_simulation = personas
+
+    if not agents_for_simulation: # Should not happen if personas is default and no file, but good for safety
+        print("Error: No agents available for simulation. Exiting.")
+        exit(1)
+
     with open("data/config.json", "r", encoding="utf-8") as f:
         json_data = json.load(f)
         agent_config = json_data["agent"]
@@ -149,7 +186,7 @@ def get_config(start_time="20240213-09:30", stride=15, agents=None):
         "agents": {},
         "api_keys": json_data["api_keys"],
     }
-    for a in agents:
+    for a in agents_for_simulation:
         config["agents"][a] = {
             "config_path": os.path.join(
                 assets_root, "agents", a.replace(" ", "_"), "agent.json"
@@ -168,35 +205,74 @@ parser.add_argument("--step", type=int, default=10, help="The simulate step")
 parser.add_argument("--stride", type=int, default=10, help="The step stride in minute")
 parser.add_argument("--verbose", type=str, default="debug", help="The verbose level")
 parser.add_argument("--log", type=str, default="", help="Name of the log file")
+parser.add_argument("--agents_file", type=str, default=None, help="Path to a JSON file containing agent configurations.")
+parser.add_argument("--validate-config", action="store_true", help="Validate configuration and print agent names, then exit.")
 args = parser.parse_args()
 
 
 if __name__ == "__main__":
     checkpoints_path = "results/checkpoints"
 
+    if args.validate_config:
+        if args.resume:
+            if not args.name:
+                print("Error: --name must be provided when using --validate-config with --resume.", file=sys.stderr)
+                exit(1)
+            checkpoints_folder = f"{checkpoints_path}/{args.name}"
+            if not os.path.exists(checkpoints_folder):
+                print(f"Error: Checkpoint folder '{checkpoints_folder}' not found for resume.", file=sys.stderr)
+                exit(1)
+            sim_config = get_config_from_log(checkpoints_folder)
+            if sim_config is None:
+                print(f"Error: Could not load config from checkpoint '{checkpoints_folder}'.", file=sys.stderr)
+                exit(1)
+        else:
+            # get_config handles its own errors and exits if agents_file is problematic
+            sim_config = get_config(args.start, args.stride, args.agents_file)
+
+        # Output the sorted list of agent names as JSON to stdout
+        if sim_config and "agents" in sim_config:
+            print(json.dumps(sorted(list(sim_config["agents"].keys()))))
+            exit(0)
+        else:
+            # Should be caught by get_config or get_config_from_log, but as a safeguard:
+            print("Error: Configuration could not be determined.", file=sys.stderr)
+            exit(1)
+
+    # Regular execution path (not --validate-config)
     name = args.name
     if len(name) < 1:
         name = input("Please enter a simulation name (e.g. sim-test): ")
 
     resume = args.resume
-    if resume:
-        while not os.path.exists(f"{checkpoints_path}/{name}"):
-            name = input(f"'{name}' doesn't exists, please re-enter the simulation name: ")
-    else:
-        while os.path.exists(f"{checkpoints_path}/{name}"):
-            name = input(f"The name '{name}' already exists, please enter a new name: ")
+    checkpoints_folder = f"{checkpoints_path}/{name}" # Define here for resume logic
 
-    checkpoints_folder = f"{checkpoints_path}/{name}"
-
-    start_time = args.start
     if resume:
+        # Loop for name input if resuming and folder doesn't exist
+        while not os.path.exists(checkpoints_folder):
+            print(f"Checkpoint folder '{checkpoints_folder}' not found for resume.")
+            name_input = input(f"'{name}' doesn't exist or path is incorrect. Please re-enter simulation name, or type 'quit' to exit: ")
+            if name_input.lower() == 'quit':
+                exit(0)
+            name = name_input
+            checkpoints_folder = f"{checkpoints_path}/{name}"
+
         sim_config = get_config_from_log(checkpoints_folder)
         if sim_config is None:
-            print("No checkpoint file found to resume running.")
+            print(f"No checkpoint file found to resume running in '{checkpoints_folder}'. Exiting.")
             exit(0)
         start_step = sim_config["step"]
     else:
-        sim_config = get_config(start_time, args.stride, personas)
+        # Loop for name input if not resuming and folder exists
+        while os.path.exists(checkpoints_folder):
+            print(f"The simulation name '{name}' already exists.")
+            name_input = input(f"Please enter a new name, or type 'quit' to exit: ")
+            if name_input.lower() == 'quit':
+                exit(0)
+            name = name_input
+            checkpoints_folder = f"{checkpoints_path}/{name}"
+
+        sim_config = get_config(args.start, args.stride, args.agents_file)
         start_step = 0
 
     static_root = "frontend/static"
