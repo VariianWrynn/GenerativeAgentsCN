@@ -12,15 +12,14 @@ file_movement = "movement.json"
 frames_per_step = 60  # 每个step包含的帧数
 
 
-# 从存档文件中读取stride
-def get_stride(json_files):
-    if len(json_files) < 1:
-        return 1
+# 从已加载的检查点数据列表中读取stride
+def get_stride_from_checkpoints(checkpoint_data_list):
+    if not checkpoint_data_list:
+        return 1 # Default stride if no checkpoints
 
-    with open(json_files[-1], "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    return config["stride"]
+    # Assume the last checkpoint has the stride information
+    last_checkpoint_data = checkpoint_data_list[-1]
+    return last_checkpoint_data.get("stride", 1)
 
 
 # 将address转换为字符串
@@ -36,158 +35,234 @@ def get_location(address):
 
 
 # 插入第0帧数据（Agent的初始状态）
-def insert_frame0(init_pos, movement, agent_name):
+def insert_frame0(init_pos, movement, agent_name, agent_static_data_content):
     key = "0"
     if key not in movement.keys():
         movement[key] = dict()
 
-    json_path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
-    with open(json_path, "r", encoding="utf-8") as f:
-        json_data = json.load(f)
-        address = json_data["spatial"]["address"]["living_area"]
+    # json_path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
+    # with open(json_path, "r", encoding="utf-8") as f:
+    #     json_data = json.load(f)
+    #     address = json_data["spatial"]["address"]["living_area"]
+    json_data = agent_static_data_content # Use passed-in content
+    address = json_data["spatial"]["address"]["living_area"]
     location = get_location(address)
     coord = json_data["coord"]
     init_pos[agent_name] = coord
     movement[key][agent_name] = {
         "location": location,
         "movement": coord,
-        "description": "正在睡觉",
+        "description": "正在睡觉", # Default initial description
     }
     movement["description"][agent_name] = {
         "currently": json_data["currently"],
         "scratch": json_data["scratch"],
     }
 
-
-# 从所有存档文件中提取数据（用于回放）
-def generate_movement(checkpoints_folder, compressed_folder, compressed_file):
-    movement_file = os.path.join(compressed_folder, compressed_file)
-
-    conversation_file = "conversation.json"
-    conversation = {}
-    if os.path.exists(os.path.join(checkpoints_folder, conversation_file)):
-        with open(os.path.join(checkpoints_folder, conversation_file), "r", encoding="utf-8") as f:
-            conversation = json.load(f)
-
-    files = sorted(os.listdir(checkpoints_folder))
-    json_files = list()
-    for file_name in files:
-        if file_name.endswith(".json") and file_name != conversation_file:
-            json_files.append(os.path.join(checkpoints_folder, file_name))
-
+# Core data processing logic extracted from generate_movement
+def _process_checkpoints_to_movement_data(checkpoint_data_list, conversation_content, static_agent_loader, maze_instance):
     persona_init_pos = dict()
     all_movement = dict()
     all_movement["description"] = dict()
     all_movement["conversation"] = dict()
 
-    stride = get_stride(json_files)
-    sec_per_step = stride
+    stride = get_stride_from_checkpoints(checkpoint_data_list)
+    sec_per_step = stride # Assuming 1 step = 1 stride minute = stride seconds for simplicity here.
+                         # This might need adjustment if sec_per_step is meant to be different from stride in minutes.
 
     result = {
-        "start_datetime": "",  # 起始时间
-        "stride": stride,  # 每个step对应的分钟数（必须与生成时的参数一致）
-        "sec_per_step": sec_per_step,  # 回放时每一帧对应的秒数
-        "persona_init_pos": persona_init_pos,  # 每个Agent的初始位置
-        "all_movement": all_movement,  # 所有Agent在每个setp中的位置变化
+        "start_datetime": "",
+        "stride": stride,
+        "sec_per_step": sec_per_step,
+        "persona_init_pos": persona_init_pos,
+        "all_movement": all_movement,
     }
 
     last_location = dict()
+    maze = maze_instance # Use passed-in maze instance
 
-    # 加载地图数据，用于计算Agent移动路径
-    json_path = "frontend/static/assets/village/maze.json"
-    with open(json_path, "r", encoding="utf-8") as f:
-        json_data = json.load(f)
-        maze = Maze(json_data, None)
+    for json_data in checkpoint_data_list: # Iterate over loaded checkpoint data
+        step = json_data["step"]
+        agents = json_data["agents"]
 
-    for file_name in json_files:
-        # 依次读取所有存档文件
-        with open(file_name, "r", encoding="utf-8") as f:
-            json_data = json.load(f)
-            step = json_data["step"]
-            agents = json_data["agents"]
-
-            # 保存回放的起始时间
-            if len(result["start_datetime"]) < 1:
+        if not result["start_datetime"] and "time" in json_data:
+            try:
                 t = datetime.strptime(json_data["time"], "%Y%m%d-%H:%M")
                 result["start_datetime"] = t.isoformat()
+            except ValueError:
+                 # Handle cases where time format might be different or missing, though unlikely for valid checkpoints
+                pass
 
-            # 遍历单个存档文件中的所有Agent
-            for agent_name, agent_data in agents.items():
-                # 插入第0帧
-                if step == 1:
-                    insert_frame0(persona_init_pos, all_movement, agent_name)
 
-                source_coord = last_location.get(agent_name, all_movement["0"][agent_name])["movement"]
-                target_coord = agent_data["coord"]
-                location = get_location(agent_data["action"]["event"]["address"])
-                if location is None:
-                    location = last_location.get(agent_name, all_movement["0"][agent_name])["location"]
-                    path = [source_coord]
+        for agent_name, agent_data in agents.items():
+            if step == 1:
+                agent_static_data = static_agent_loader(agent_name)
+                if agent_static_data:
+                    insert_frame0(persona_init_pos, all_movement, agent_name, agent_static_data)
                 else:
-                    path = maze.find_path(source_coord, target_coord)
+                    # Handle missing static data if necessary, e.g., skip agent or use defaults
+                    print(f"Warning: Static data for agent {agent_name} not found. Skipping frame 0 insertion.")
+                    continue # Or handle more gracefully
 
-                had_conversation = False
-                step_conversation = ""
-                persons_in_conversation = []
-                step_time = json_data["time"]
-                if step_time in conversation.keys():
-                    for chats in conversation[step_time]:
-                        for persons, chat in chats.items():
-                            persons_in_conversation.append(persons.split(" @ ")[0].split(" -> "))
-                            step_conversation += f"\n地点：{persons.split(' @ ')[1]}\n\n"
-                            for c in chat:
-                                agent = c[0]
-                                text = c[1]
-                                step_conversation += f"{agent}：{text}\n"
+            # Ensure frame 0 data exists for the agent before proceeding
+            if agent_name not in persona_init_pos or "0" not in all_movement or agent_name not in all_movement["0"]:
+                 # This can happen if the first checkpoint is not step 1, or static_agent_loader failed.
+                 # For robustness, we might need to initialize last_location more carefully
+                 # or ensure that step 1 always populates this.
+                 # If this is critical, we might need to load static data here too if not step 1.
+                 # For now, assume step 1 correctly initializes.
+                 if step > 1: # If not first step and agent is missing frame 0, try to load it
+                    agent_static_data = static_agent_loader(agent_name)
+                    if agent_static_data:
+                         insert_frame0(persona_init_pos, all_movement, agent_name, agent_static_data)
+                    else: # If still can't load, skip this agent for this step
+                        print(f"Warning: Agent {agent_name} missing frame 0 data at step {step}. Skipping.")
+                        continue
 
-                for i in range(frames_per_step):
-                    moving = len(path) > 1
-                    if len(path) > 0:
-                        movement = list(path[0])
+
+            source_coord_data = last_location.get(agent_name, all_movement.get("0", {}).get(agent_name))
+            if not source_coord_data: # If agent wasn't in frame 0 (e.g. new agent appearing later)
+                # This case needs careful handling. For now, let's assume agents exist from step 1 / frame 0.
+                # Or, initialize with current coord if it's their first appearance.
+                print(f"Warning: Agent {agent_name} has no previous location at step {step}. Using current coord as source.")
+                source_coord = agent_data["coord"]
+                # Initialize last_location for this agent
+                last_location[agent_name] = {"movement": source_coord, "location": get_location(agent_data.get("action", {}).get("event", {}).get("address", ["<world>"]))}
+
+            else:
+                source_coord = source_coord_data["movement"]
+
+
+            target_coord = agent_data["coord"]
+            action_event = agent_data.get("action", {}).get("event", {})
+            location = get_location(action_event.get("address", ["<world>"])) # Default to world if no address
+
+            if location is None or location == get_location(["<world>"]): # Check if location is placeholder or non-specific
+                location = last_location.get(agent_name, {}).get("location", get_location(["<world>", "somewhere"])) # Use last known or a default
+                path = [source_coord] # No actual path if location is unknown or same as last
+            else:
+                path = maze.find_path(source_coord, target_coord)
+                if not path: # If find_path returns empty (e.g., source == target or unreachable)
+                    path = [source_coord]
+
+
+            had_conversation = False
+            step_conversation_text = "" # Renamed to avoid conflict
+            persons_in_conversation = []
+            step_time = json_data["time"]
+
+            # Use conversation_content passed as argument
+            if step_time in conversation_content:
+                for chats_entry in conversation_content[step_time]: # Iterate through list of conversations at this time
+                    for persons, chat_log in chats_entry.items():
+                        # Correctly extract agent names involved in the chat
+                        chatting_pair = persons.split(" @ ")[0].split(" -> ")
+                        persons_in_conversation.append(chatting_pair)
+                        step_conversation_text += f"\n地点：{persons.split(' @ ')[1]}\n\n"
+                        for c_agent, c_text in chat_log:
+                            step_conversation_text += f"{c_agent}：{c_text}\n"
+
+            for i in range(frames_per_step):
+                moving = len(path) > 1
+                current_movement_frame = None # Initialize to None
+
+                if path: # Check if path is not empty
+                    current_movement_frame = list(path[0]) # Take the current frame's movement
+                    if len(path) > 1: # Only advance path if there are more steps in it
                         path = path[1:]
-                        if agent_name not in last_location.keys():
-                            last_location[agent_name] = dict()
-                        last_location[agent_name]["movement"] = movement
-                        last_location[agent_name]["location"] = location
-                    else:
-                        movement = None
+                    # Update last_location with the current frame's state
+                    if agent_name not in last_location: last_location[agent_name] = {}
+                    last_location[agent_name]["movement"] = current_movement_frame
+                    last_location[agent_name]["location"] = location
+                # If path was empty or became empty, current_movement_frame remains None or its last value
 
-                    if moving:
-                        action = f"前往 {location}"
-                    elif movement is not None:
-                        action = agent_data["action"]["event"]["describe"]
-                        if len(action) < 1:
-                            action = f'{agent_data["action"]["event"]["predicate"]}{agent_data["action"]["event"]["object"]}'
+                action_description = ""
+                if moving:
+                    action_description = f"前往 {location}"
+                elif current_movement_frame is not None: # Agent is at destination or was already there
+                    action_description = action_event.get("describe", "")
+                    if not action_description:
+                        action_description = f'{action_event.get("predicate", "")}{action_event.get("object", "")}'
 
-                        # 判断该存档文件中当前Agent是否有新的对话（用于设置图标）
-                        for persons in persons_in_conversation:
-                            if agent_name in persons:
-                                had_conversation = True
-                                break
+                    agent_had_chat_this_step = any(agent_name in pair for pair in persons_in_conversation)
 
-                        # 针对睡觉和对话设置图标
-                        if "睡觉" in action:
-                            action = "😴 " + action
-                        elif had_conversation:
-                            action = "💬 " + action
+                    if "睡觉" in action_description:
+                        action_description = "😴 " + action_description
+                    elif agent_had_chat_this_step:
+                        action_description = "💬 " + action_description
 
-                    step_key = "%d" % ((step-1) * frames_per_step + 1 + i)
-                    if step_key not in all_movement.keys():
-                        all_movement[step_key] = dict()
+                # Frame key calculation
+                step_key = str((step - 1) * frames_per_step + i) # Frame 0 is handled by insert_frame0
 
-                    if movement is not None:
-                        all_movement[step_key][agent_name] = {
-                            "location": location,
-                            "movement": movement,
-                            "action": action,
-                        }
-                all_movement["conversation"][step_time] = step_conversation
+                if step_key not in all_movement:
+                    all_movement[step_key] = {}
 
-    # 保存数据
-    with open(movement_file, "w", encoding="utf-8") as f:
-        f.write(json.dumps(result, indent=2, ensure_ascii=False))
+                if current_movement_frame is not None: # Only add entry if there's movement/action
+                    all_movement[step_key][agent_name] = {
+                        "location": location,
+                        "movement": current_movement_frame,
+                        "action": action_description,
+                    }
+            if step_time not in all_movement["conversation"]: # Ensure key exists
+                 all_movement["conversation"][step_time] = ""
+            all_movement["conversation"][step_time] += step_conversation_text # Append, as multiple conversations can happen at same time step for different pairs
 
     return result
+
+
+# 从所有存档文件中提取数据（用于回放）
+def generate_movement(checkpoints_folder, compressed_folder, compressed_file_name):
+    movement_file_path = os.path.join(compressed_folder, compressed_file_name)
+
+    # Load conversation.json
+    conversation_content = {}
+    conversation_json_path = os.path.join(checkpoints_folder, "conversation.json")
+    if os.path.exists(conversation_json_path):
+        with open(conversation_json_path, "r", encoding="utf-8") as f:
+            conversation_content = json.load(f)
+
+    # Load all checkpoint JSON files
+    checkpoint_data_list = []
+    files = sorted(os.listdir(checkpoints_folder))
+    for file_name in files:
+        if file_name.endswith(".json") and file_name != "conversation.json":
+            file_path = os.path.join(checkpoints_folder, file_name)
+            with open(file_path, "r", encoding="utf-8") as f:
+                checkpoint_data_list.append(json.load(f))
+
+    # Sort by step to ensure chronological order
+    checkpoint_data_list.sort(key=lambda cp: cp.get("step", 0))
+
+
+    # Create static_agent_loader function
+    def static_agent_loader(agent_name_str):
+        json_path = f"frontend/static/assets/village/agents/{agent_name_str}/agent.json"
+        if os.path.exists(json_path):
+            with open(json_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return None # Or raise an error
+
+    # Load maze.json and instantiate Maze
+    maze_json_path = "frontend/static/assets/village/maze.json"
+    if not os.path.exists(maze_json_path):
+        raise FileNotFoundError(f"Maze file not found: {maze_json_path}")
+    with open(maze_json_path, "r", encoding="utf-8") as f:
+        maze_data = json.load(f)
+    maze_instance = Maze(maze_data, None) # Assuming Maze constructor takes data and optionally a logger or similar
+
+    # Call the core processing function
+    result_data = _process_checkpoints_to_movement_data(
+        checkpoint_data_list,
+        conversation_content,
+        static_agent_loader,
+        maze_instance
+    )
+
+    # Write the result to movement.json
+    with open(movement_file_path, "w", encoding="utf-8") as f:
+        json.dump(result_data, f, indent=2, ensure_ascii=False)
+
+    return result_data
 
 
 # 生成Markdown文档

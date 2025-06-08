@@ -51,18 +51,27 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            pattern = [
-                "评分[:： ]+(\d{1,2})",
-                "(\d{1,2})",
-            ]
-            return int(parse_llm_output(response, pattern, "match_last"))
+        default_failsafe = random.choice(list(range(1, 11))) # Ensure failsafe is 1-10
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": random.choice(list(range(10))) + 1,
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    r"评分[:：\s]*(\d{1,2})", # Matches "评分: 10" or "评分：10" or "评分 10"
+                    r"(\d{1,2})",           # Matches "10" if only number is present
+                ]
+                # mode="match_last" because LLM might have reasoning then the score.
+                parsed_score_str = parse_llm_output(llm_response_text, patterns, mode="match_last", ignore_empty=False)
+
+                assert parsed_score_str, "Parsed poignancy score string is empty."
+
+                score = int(parsed_score_str)
+                assert 1 <= score <= 10, f"Parsed poignancy score '{score}' out of range (1-10)."
+
+                return score
+            except (AssertionError, ValueError):
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_poignancy_chat(self, event):
         prompt = self.build_prompt(
@@ -74,18 +83,26 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            pattern = [
-                "评分[:： ]+(\d{1,2})",
-                "(\d{1,2})",
-            ]
-            return int(parse_llm_output(response, pattern, "match_last"))
+        default_failsafe = random.choice(list(range(1, 11))) # Ensure failsafe is 1-10
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": random.choice(list(range(10))) + 1,
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    r"评分[:：\s]*(\d{1,2})", # Matches "评分: 10" etc.
+                    r"(\d{1,2})",           # Matches "10"
+                ]
+                parsed_score_str = parse_llm_output(llm_response_text, patterns, mode="match_last", ignore_empty=False)
+
+                assert parsed_score_str, "Parsed poignancy score string for chat is empty."
+
+                score = int(parsed_score_str)
+                assert 1 <= score <= 10, f"Parsed poignancy chat score '{score}' out of range (1-10)."
+
+                return score
+            except (AssertionError, ValueError):
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_wake_up(self):
         prompt = self.build_prompt(
@@ -97,18 +114,33 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            patterns = [
-                "(\d{1,2}):00",
-                "(\d{1,2})",
-                "\d{1,2}",
-            ]
-            wake_up_time = int(parse_llm_output(response, patterns))
-            if wake_up_time > 11:
-                wake_up_time = 11
-            return wake_up_time
+        default_failsafe = 6
 
-        return {"prompt": prompt, "callback": _callback, "failsafe": 6}
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    "(\d{1,2}):00", # e.g., "08:00" or "8:00"
+                    "(\d{1,2})",    # e.g., "8"
+                    "\d{1,2}",      # e.g., "8" (if LLM just returns number)
+                ]
+                parsed_time_str = parse_llm_output(llm_response_text, patterns, ignore_empty=False)
+
+                if not parsed_time_str:
+                    assert False, "Parsed wake_up_time string is empty."
+
+                wake_up_time = int(parsed_time_str)
+
+                # Validate that the hour is within a reasonable range (e.g., 0-23)
+                # The original code had a specific upper limit for wake_up_time.
+                assert 0 <= wake_up_time <= 23, f"Parsed wake_up_time '{wake_up_time}' is not a valid hour."
+
+                if wake_up_time > 11: # This was an existing logic constraint
+                    return 11
+                return wake_up_time
+            except (AssertionError, ValueError): # ValueError if int(parsed_time_str) fails
+                return None # Signal to LLMModel.completion to retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_schedule_init(self, wake_up):
         prompt = self.build_prompt(
@@ -121,27 +153,38 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            patterns = [
-                "\d{1,2}\. (.*)。",
-                "\d{1,2}\. (.*)",
-                "\d{1,2}\) (.*)。",
-                "\d{1,2}\) (.*)",
-                "(.*)。",
-                "(.*)",
-            ]
-            return parse_llm_output(response, patterns, mode="match_all")
-
-        failsafe = [
-            "早上6点起床并完成早餐的例行工作",
-            "早上7点吃早餐",
-            "早上8点看书",
-            "中午12点吃午饭",
-            "下午1点小睡一会儿",
-            "晚上7点放松一下，看电视",
-            "晚上11点睡觉",
+        default_failsafe = [
+            "早上6点起床并完成早餐的例行工作", "早上7点吃早餐", "早上8点看书",
+            "中午12点吃午饭", "下午1点小睡一会儿", "晚上7点放松一下，看电视", "晚上11点睡觉",
         ]
-        return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
+
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    "\d{1,2}\. (.*)。",
+                    "\d{1,2}\. (.*)",
+                    "\d{1,2}\) (.*)。",
+                    "\d{1,2}\) (.*)",
+                    # More general patterns if the numbering is missing
+                    "^- (.*)。",
+                    "^- (.*)",
+                    "^(.*)。", # Captures a line ending with a period
+                    "^(.*)",   # Captures a whole line
+                ]
+                # mode="match_all" returns a list of all non-overlapping matches.
+                # Each item in the list is a tuple of captured groups if multiple groups,
+                # or a string if only one group. Here, one group, so list of strings.
+                parsed_schedule_items = parse_llm_output(llm_response_text, patterns, mode="match_all", ignore_empty=True)
+
+                # Ensure we got something, e.g., at least a few schedule items
+                assert parsed_schedule_items and len(parsed_schedule_items) >= 3, \
+                       f"Parsed initial schedule has too few items: {len(parsed_schedule_items)}."
+
+                return parsed_schedule_items
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_schedule_daily(self, wake_up, daily_schedule):
         hourly_schedule = ""
@@ -182,17 +225,37 @@ class Scratch:
         }
 
         def _callback(response):
-            patterns = [
-                "\[(\d{1,2}:\d{2})\] " + self.name + "(.*)。",
-                "\[(\d{1,2}:\d{2})\] " + self.name + "(.*)",
-                "\[(\d{1,2}:\d{2})\] " + "(.*)。",
-                "\[(\d{1,2}:\d{2})\] " + "(.*)",
-            ]
-            outputs = parse_llm_output(response, patterns, mode="match_all")
-            assert len(outputs) >= 5, "less than 5 schedules"
-            return {s[0]: s[1] for s in outputs}
+        # failsafe is already defined before this snippet in the original code
 
-        return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    r"\[(\d{1,2}:\d{2})\] " + re.escape(self.name) + r"(.*)。",
+                    r"\[(\d{1,2}:\d{2})\] " + re.escape(self.name) + r"(.*)",
+                    r"\[(\d{1,2}:\d{2})\] (.*)。", # Simpler if name is not included
+                    r"\[(\d{1,2}:\d{2})\] (.*)",   # Simpler if name is not included
+                ]
+                # mode="match_all" returns a list of tuples, where each tuple contains (time_str, activity_str)
+                outputs = parse_llm_output(llm_response_text, patterns, mode="match_all", ignore_empty=True)
+
+                assert outputs and len(outputs) >= 5, \
+                       f"Parsed daily schedule has too few items: {len(outputs)}. Got: {outputs}"
+
+                # Convert list of (time_str, activity_str) tuples to dict {time_str: activity_str}
+                schedule_dict = {s[0]: s[1].strip() for s in outputs}
+
+                # Optional: Further validation on schedule_dict keys/values if needed
+                assert len(schedule_dict) >= 5, \
+                       f"Constructed schedule dictionary has too few unique time entries: {len(schedule_dict)}"
+
+                return schedule_dict
+            except AssertionError:
+                return None # Signal retry
+            except Exception: # Catch any other potential errors during processing (e.g. s[0], s[1] access)
+                return None
+
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": failsafe}
 
     def prompt_schedule_decompose(self, plan, schedule):
         def _plan_des(plan):
@@ -218,19 +281,40 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            patterns = [
-                "\d{1,2}\) .*\*计划\* (.*)[\(（]+耗时[:： ]+(\d{1,2})[,， ]+剩余[:： ]+\d*[\)）]",
-            ]
-            schedules = parse_llm_output(response, patterns, mode="match_all")
-            schedules = [(s[0].strip("."), int(s[1])) for s in schedules]
-            left = plan["duration"] - sum([s[1] for s in schedules])
-            if left > 0:
-                schedules.append((plan["describe"], left))
-            return schedules
+        default_failsafe = [(plan["describe"], 10) for _ in range(int(plan["duration"] / 10))]
 
-        failsafe = [(plan["describe"], 10) for _ in range(int(plan["duration"] / 10))]
-        return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    # Matches "1) *计划* activity (耗时: 10, 剩余: 0)" - note the flexible spaces and punctuation
+                    r"\d{1,2}\)\s*\*计划\*\s*(.*?)[\(（]\s*耗时[:：\s]*(\d{1,2})\s*[,，\s]*剩余[:：\s]*\d*\s*[\)）]",
+                ]
+                # mode="match_all" returns list of (activity_str, duration_str) tuples
+                parsed_outputs = parse_llm_output(llm_response_text, patterns, mode="match_all", ignore_empty=True)
+
+                assert parsed_outputs, "No schedule items parsed for decompose."
+
+                schedules = []
+                total_parsed_duration = 0
+                for item_activity, item_duration_str in parsed_outputs:
+                    item_duration = int(item_duration_str) # Can raise ValueError
+                    schedules.append((item_activity.strip("."), item_duration))
+                    total_parsed_duration += item_duration
+
+                # Ensure total duration from parsed items is reasonable, e.g., not vastly exceeding original plan
+                # This is a soft check; primary goal is parsing.
+                # assert total_parsed_duration <= plan["duration"] * 1.5, "Total duration of decomposed items exceeds plan."
+
+                left = plan["duration"] - total_parsed_duration
+                if left > 0:
+                    schedules.append((plan["describe"], left))
+
+                assert schedules, "Resulting schedule list is empty after processing." # Should have at least one item
+                return schedules
+            except (AssertionError, ValueError): # ValueError from int()
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_schedule_revise(self, action, schedule):
         plan, _ = schedule.current_plan()
@@ -275,28 +359,44 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            patterns = [
-                "^\[(\d{1,2}:\d{1,2}) ?- ?(\d{1,2}:\d{1,2})\] (.*)",
-                "^\[(\d{1,2}:\d{1,2}) ?~ ?(\d{1,2}:\d{1,2})\] (.*)",
-                "^\[(\d{1,2}:\d{1,2}) ?至 ?(\d{1,2}:\d{1,2})\] (.*)",
-            ]
-            schedules = parse_llm_output(response, patterns, mode="match_all")
-            decompose = []
-            for start, end, describe in schedules:
-                m_start = utils.daily_duration(utils.to_date(start, "%H:%M"))
-                m_end = utils.daily_duration(utils.to_date(end, "%H:%M"))
-                decompose.append(
-                    {
-                        "idx": len(decompose),
-                        "describe": describe,
-                        "start": m_start,
-                        "duration": m_end - m_start,
-                    }
-                )
-            return decompose
+        default_failsafe = plan["decompose"] # Original decomposed plan as failsafe
 
-        return {"prompt": prompt, "callback": _callback, "failsafe": plan["decompose"]}
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    r"^\[(\d{1,2}:\d{1,2})\s*-\s*(\d{1,2}:\d{1,2})\]\s*(.*)",
+                    r"^\[(\d{1,2}:\d{1,2})\s*~\s*(\d{1,2}:\d{1,2})\]\s*(.*)",
+                    r"^\[(\d{1,2}:\d{1,2})\s*至\s*(\d{1,2}:\d{1,2})\]\s*(.*)",
+                ]
+                # mode="match_all" returns list of (start_str, end_str, describe_str) tuples
+                parsed_schedules = parse_llm_output(llm_response_text, patterns, mode="match_all", ignore_empty=True)
+
+                assert parsed_schedules, "No schedule items parsed for revise."
+
+                decomposed_result = []
+                for idx, item_tuple in enumerate(parsed_schedules):
+                    assert len(item_tuple) == 3, f"Parsed schedule item is not a 3-tuple: {item_tuple}"
+                    start_str, end_str, describe_str = item_tuple
+
+                    m_start = utils.daily_duration(utils.to_date(start_str, "%H:%M")) # Can raise ValueError
+                    m_end = utils.daily_duration(utils.to_date(end_str, "%H:%M"))   # Can raise ValueError
+
+                    duration = m_end - m_start
+                    assert duration >= 0, f"Negative duration calculated for item: {describe_str}"
+
+                    decomposed_result.append({
+                        "idx": idx, # Use current index, original idx might not be relevant after revision
+                        "describe": describe_str.strip(),
+                        "start": m_start,
+                        "duration": duration,
+                    })
+
+                assert decomposed_result, "Resulting revised schedule is empty after processing."
+                return decomposed_result
+            except (AssertionError, ValueError, TypeError, IndexError): # Catch various parsing/conversion errors
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_determine_sector(self, describes, spatial, address, tile):
         live_address = spatial.find_address("living_area", as_list=True)[:-1]
@@ -323,26 +423,46 @@ class Scratch:
             arenas.update(
                 {a: sec for a in spatial.get_leaves(address + [sec]) if a not in arenas}
             )
-        failsafe = random.choice(sectors)
+        failsafe = random.choice(sectors) # This is the ultimate failsafe if callback returns None after retries
 
-        def _callback(response):
-            patterns = [
-                ".*应该去[:： ]*(.*)。",
-                ".*应该去[:： ]*(.*)",
-                "(.+)。",
-                "(.+)",
-            ]
-            sector = parse_llm_output(response, patterns)
-            if sector in sectors:
-                return sector
-            if sector in arenas:
-                return arenas[sector]
-            for s in sectors:
-                if sector.startswith(s):
-                    return s
-            return failsafe
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    ".*应该去[:： ]*(.*)。",
+                    ".*应该去[:： ]*(.*)",
+                    "(.+)。", # Less specific, more likely to match something
+                    "(.+)",  # Even less specific
+                ]
+                # mode defaults to 'match_first_group_in_first_pattern'
+                raw_sector = parse_llm_output(llm_response_text, patterns, ignore_empty=False)
 
-        return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
+                if not raw_sector: # If parse_llm_output returns empty string
+                    assert False, "Parsed sector is empty."
+
+                if raw_sector in sectors:
+                    return raw_sector
+                if raw_sector in arenas: # arenas maps arenas back to sectors
+                    return arenas[raw_sector]
+                # Check if the parsed output is a substring of any valid sector (e.g. LLM says "village shop" but sector is "shop")
+                # This might be too lenient, but let's try a more direct match first.
+                # More robust: check if the response *contains* a valid sector, but parse_llm_output with greedy patterns should handle this.
+                for s_check in sectors: # Check if the raw_sector is a valid sector name, even if LLM included extra words
+                    if s_check in raw_sector: # e.g. raw_sector = "the Oak Hill Cafe" and s_check = "Oak Hill Cafe"
+                                            # This logic is now implicitly handled by parse_llm_output if patterns are good.
+                                            # The original patterns are quite greedy.
+                        # The previous patterns were designed to extract the core part.
+                        # If raw_sector itself is not in `sectors` or `arenas` keys, it's a problem.
+                        pass # Let it fall through to the assert if not directly in sectors or arenas keys
+
+                # If raw_sector is not directly a key in sectors or arenas (mapping to a sector),
+                # and not a superstring that got correctly parsed by a greedy pattern,
+                # then it's a failure for our specific validation.
+                assert False, f"Parsed sector '{raw_sector}' not in valid sectors or arena mappings."
+
+            except AssertionError:
+                return None # Signal to LLMModel.completion to retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": failsafe}
 
     def prompt_determine_arena(self, describes, spatial, address):
         prompt = self.build_prompt(
@@ -358,19 +478,33 @@ class Scratch:
         )
 
         arenas = spatial.get_leaves(address)
-        failsafe = random.choice(arenas)
+        failsafe = random.choice(arenas) # Ultimate failsafe
 
-        def _callback(response):
-            patterns = [
-                ".*应该去[:： ]*(.*)。",
-                ".*应该去[:： ]*(.*)",
-                "(.+)。",
-                "(.+)",
-            ]
-            arena = parse_llm_output(response, patterns)
-            return arena if arena in arenas else failsafe
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    ".*应该去[:： ]*(.*)。",
+                    ".*应该去[:： ]*(.*)",
+                    "(.+)。",
+                    "(.+)",
+                ]
+                # mode defaults to 'match_first_group_in_first_pattern'
+                parsed_arena = parse_llm_output(llm_response_text, patterns, ignore_empty=False)
 
-        return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
+                if not parsed_arena:
+                    assert False, "Parsed arena is empty."
+
+                if parsed_arena in arenas:
+                    return parsed_arena
+
+                # Add more sophisticated checks if needed, e.g., if LLM adds extra words.
+                # For now, require a direct match after parsing.
+                assert False, f"Parsed arena '{parsed_arena}' not in valid arenas."
+
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": failsafe}
 
     def prompt_determine_object(self, describes, spatial, address):
         objects = spatial.get_leaves(address)
@@ -383,20 +517,36 @@ class Scratch:
             }
         )
 
-        failsafe = random.choice(objects)
+        failsafe = random.choice(objects) # Ultimate failsafe
 
-        def _callback(response):
-            # pattern = ["The most relevant object from the Objects is: <(.+?)>", "<(.+?)>"]
-            patterns = [
-                ".*是[:： ]*(.*)。",
-                ".*是[:： ]*(.*)",
-                "(.+)。",
-                "(.+)",
-            ]
-            obj = parse_llm_output(response, patterns)
-            return obj if obj in objects else failsafe
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    ".*是[:： ]*(.*)。",
+                    ".*是[:： ]*(.*)",
+                    "(.+)。",
+                    "(.+)",
+                ]
+                # mode defaults to 'match_first_group_in_first_pattern'
+                parsed_object = parse_llm_output(llm_response_text, patterns, ignore_empty=False)
 
-        return {"prompt": prompt, "callback": _callback, "failsafe": failsafe}
+                if not parsed_object:
+                    assert False, "Parsed object is empty."
+
+                if parsed_object in objects:
+                    return parsed_object
+
+                # Fallback: check if any of the known objects is a substring of the parsed_object
+                # This handles cases like "the old bookshelf" when "bookshelf" is a known object.
+                for known_obj in objects:
+                    if known_obj in parsed_object:
+                        return known_obj # Return the known object name
+
+                assert False, f"Parsed object '{parsed_object}' not in or does not contain any valid objects."
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": failsafe}
 
     def prompt_describe_emoji(self, describe):
         prompt = self.build_prompt(
@@ -474,14 +624,33 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            patterns = [
-                "<" + obj + "> ?" + "(.*)。",
-                "<" + obj + "> ?" + "(.*)",
-            ]
-            return parse_llm_output(response, patterns)
+        default_failsafe = "空闲"
 
-        return {"prompt": prompt, "callback": _callback, "failsafe": "空闲"}
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    "<" + obj + "> ?" + "(.*)。", # Matches "obj_name is state."
+                    "<" + obj + "> ?" + "(.*)",   # Matches "obj_name is state"
+                    # Broader patterns if the LLM doesn't use the <obj> tag:
+                    obj + "现在是?" + "(.*)。", # Matches "obj_name is now state."
+                    obj + "现在是?" + "(.*)",   # Matches "obj_name is now state"
+                    obj + "是?" + "(.*)。",     # Matches "obj_name is state."
+                    obj + "是?" + "(.*)",       # Matches "obj_name is state"
+                ]
+                # mode defaults to 'match_first_group_in_first_pattern'
+                parsed_description = parse_llm_output(llm_response_text, patterns, ignore_empty=False)
+
+                if not parsed_description: # If parse_llm_output returns empty
+                    # Try a very generic parse if specific ones fail, though this might be too loose
+                    # For object description, an empty string might be acceptable if LLM provides nothing meaningful
+                    # However, to ensure some output or trigger retry for better output:
+                    assert False, f"Parsed description for object '{obj}' is empty."
+
+                return parsed_description.strip()
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_decide_chat(self, agent, other, focus, chats):
         def _status_des(a):
@@ -629,14 +798,17 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            return response
+        default_failsafe = agent.name + " 正在看着 " + other_name
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": agent.name + " 正在看着 " + other_name,
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                parsed_relation = llm_response_text.strip()
+                assert parsed_relation, "Summarized relation is empty."
+                return parsed_relation
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_generate_chat(self, agent, other, relation, chats):
         focus = [relation, other.get_event().get_describe()]
@@ -681,19 +853,43 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            assert "{" in response and "}" in response
-            json_content = utils.load_dict(
-                "{" + response.split("{")[1].split("}")[0] + "}"
-            )
-            text = json_content[agent.name].replace("\n\n", "\n").strip(" \n\"'“”‘’")
-            return text
+        default_failsafe = "嗯"
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": "嗯",
-        }
+        # This specific callback needs `agent` from the outer scope for json_content[agent.name]
+        # So, we pass it to the parsing_callback_factory or define parsing_callback inside prompt_generate_chat
+
+        def parsing_callback(llm_response_text):
+            try:
+                # Ensure the response contains a parsable JSON block for the agent's speech.
+                # The original code expects something like "... { "AgentName": "Speech content..." } ..."
+                # A more robust way to find the JSON block might be needed if the LLM is inconsistent.
+                # For now, stick to the original logic of finding the first '{' and last '}'.
+
+                first_brace = llm_response_text.find("{")
+                last_brace = llm_response_text.rfind("}")
+
+                assert first_brace != -1 and last_brace != -1 and last_brace > first_brace, \
+                    f"Valid JSON block not found in response: {llm_response_text[:100]}"
+
+                json_str_to_parse = llm_response_text[first_brace : last_brace + 1]
+
+                # utils.load_dict might be a custom JSON loader; assume it can raise json.JSONDecodeError or similar
+                json_content = utils.load_dict(json_str_to_parse)
+
+                # agent.name is from the outer scope of prompt_generate_chat
+                assert agent.name in json_content, f"Agent name '{agent.name}' not in parsed JSON keys: {list(json_content.keys())}"
+
+                text = json_content[agent.name]
+                assert isinstance(text, str), "Parsed chat content is not a string."
+
+                text = text.replace("\n\n", "\n").strip(" \n\"'“”‘’")
+                assert text, "Generated chat text is empty after stripping."
+
+                return text
+            except (AssertionError, json.JSONDecodeError, KeyError, IndexError): # Added IndexError for split issues if that was used
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_generate_chat_check_repeat(self, agent, chats, content):
         conversation = "\n".join(["{}: {}".format(n, u) for n, u in chats])
@@ -727,19 +923,20 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            return response.strip()
-
         if len(chats) > 1:
-            failsafe = "{} 和 {} 之间的普通对话".format(chats[0][0], chats[1][0])
+            default_failsafe = "{} 和 {} 之间的普通对话".format(chats[0][0], chats[1][0])
         else:
-            failsafe = "{} 说的话没有得到回应".format(chats[0][0])
+            default_failsafe = "{} 说的话没有得到回应".format(chats[0][0])
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": failsafe,
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                parsed_summary = llm_response_text.strip()
+                assert parsed_summary, "Summarized chat is empty."
+                return parsed_summary
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_reflect_focus(self, nodes, topk):
         prompt = self.build_prompt(
@@ -750,19 +947,32 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            pattern = ["^\d{1}\. (.*)", "^\d{1}\) (.*)", "^\d{1} (.*)"]
-            return parse_llm_output(response, pattern, mode="match_all")
+        default_failsafe = [
+            "{} 是谁？".format(self.name), "{} 住在哪里？".format(self.name),
+            "{} 今天要做什么？".format(self.name),
+        ]
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": [
-                "{} 是谁？".format(self.name),
-                "{} 住在哪里？".format(self.name),
-                "{} 今天要做什么？".format(self.name),
-            ],
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    r"^\d{1}\.\s*(.*)", # Matches "1. text"
+                    r"^\d{1}\)\s*(.*)", # Matches "1) text"
+                    r"^\d{1}\s+(.*)",   # Matches "1 text" (less common)
+                    r"^-\s*(.*)",       # Matches "- text"
+                ]
+                # mode="match_all" returns a list of strings
+                parsed_focus_list = parse_llm_output(llm_response_text, patterns, mode="match_all", ignore_empty=True)
+
+                processed_list = [item.strip() for item in parsed_focus_list if item.strip()]
+
+                assert processed_list, \
+                       f"Parsed reflect focus list is empty after processing. Raw: {llm_response_text[:300]}"
+
+                return processed_list
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_reflect_insights(self, nodes, topk):
         prompt = self.build_prompt(
@@ -773,36 +983,59 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            patterns = [
-                "^\d{1}[\. ]+(.*)[。 ]*[\(（]+.*序号[:： ]+([\d,， ]+)[\)）]",
-                "^\d{1}[\. ]+(.*)[。 ]*[\(（]([\d,， ]+)[\)）]",
-            ]
-            insights, outputs = [], parse_llm_output(
-                response, patterns, mode="match_all"
-            )
-            if outputs:
-                for output in outputs:
-                    if isinstance(output, str):
-                        insight, node_ids = output, []
-                    elif len(output) == 2:
-                        insight, reason = output
-                        indices = [int(e.strip()) for e in reason.split(",")]
-                        node_ids = [nodes[i].node_id for i in indices if i < len(nodes)]
-                    insights.append([insight.strip(), node_ids])
-                return insights
-            raise Exception("Can not find insights")
+        default_failsafe = [[f"{self.name} 在考虑下一步该做什么", [nodes[0].node_id if nodes else ""]]]
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": [
-                [
-                    "{} 在考虑下一步该做什么".format(self.name),
-                    [nodes[0].node_id],
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    # Matches "1. Insight text (序号: 1, 2, 3)" or "1. Insight text (1, 2, 3)"
+                    # Made insight part non-greedy (.*?) and node_indices_str greedy ([\d,\s，]+)
+                    r"^\d{1}[\.\s]+(.*?)[.。\s]*[\(（]\s*(?:.*序号[:：\s]*)?([\d,\s，]+)[\)）]",
                 ]
-            ],
-        }
+                # mode="match_all" returns list of (insight_str, node_indices_str) tuples
+                parsed_outputs = parse_llm_output(llm_response_text, patterns, mode="match_all", ignore_empty=True)
+
+                assert parsed_outputs, f"No insights parsed from text: {llm_response_text[:500]}"
+
+                insights_result = []
+                for output_tuple in parsed_outputs:
+                    # Ensure output_tuple is a tuple and has at least 2 elements, though pattern implies exactly 2.
+                    if not (isinstance(output_tuple, (list, tuple)) and len(output_tuple) == 2):
+                        # Log or handle malformed tuple if necessary, then skip or assert
+                        # For now, we'll be strict and expect parse_llm_output to give correct tuples based on pattern.
+                        # This could be an assertion failure if a specific tuple structure is critical.
+                        # However, parse_llm_output for 'match_all' with groups returns list of tuples of strings.
+                        # If a match occurs but a group is empty, it's an empty string.
+                        pass # Let it proceed, subsequent code might fail if parts are empty where not expected.
+
+
+                    insight_str, node_indices_str = output_tuple
+                    insight_text = insight_str.strip()
+
+                    processed_node_ids = []
+                    if node_indices_str: # Check if node_indices_str is not empty
+                        try:
+                            # Split by comma or space, handling Chinese comma as well
+                            indices_str_list = re.split(r'[,\s，]+', node_indices_str.strip())
+                            # Filter out empty strings that might result from multiple spaces/commas
+                            valid_indices_str = [s for s in indices_str_list if s.strip().isdigit()]
+                            indices = [int(s) for s in valid_indices_str]
+                            processed_node_ids = [nodes[i].node_id for i in indices if i < len(nodes)]
+                        except ValueError:
+                            # This handles if int(s) fails for a non-digit string part not filtered by isdigit
+                            # (though isdigit should prevent this).
+                            # Or if nodes itself is not what's expected, though that's outside parsing.
+                            pass # Or log: self.logger.warning(f"Could not parse node indices: {node_indices_str}")
+
+                    assert insight_text, "Parsed insight text is empty." # Ensure insight text itself isn't empty
+                    insights_result.append([insight_text, processed_node_ids])
+
+                assert insights_result, "Resulting insights list is empty after processing all parsed outputs."
+                return insights_result
+            except (AssertionError, ValueError, TypeError, IndexError): # Catch various errors
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_reflect_chat_planing(self, chats):
         all_chats = "\n".join(["{}: {}".format(n, c) for n, c in chats])
@@ -815,14 +1048,17 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            return response
+        default_failsafe = f"{self.name} 进行了一次对话"
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": f"{self.name} 进行了一次对话",
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                parsed_text = llm_response_text.strip()
+                assert parsed_text, "Reflected chat planning is empty."
+                return parsed_text
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_reflect_chat_memory(self, chats):
         all_chats = "\n".join(["{}: {}".format(n, c) for n, c in chats])
@@ -835,15 +1071,17 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            return response
+        default_failsafe = f"{self.name} 进行了一次对话"
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            # "failsafe": f"{self.name} had a sonversation",
-            "failsafe": f"{self.name} 进行了一次对话",
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                parsed_text = llm_response_text.strip()
+                assert parsed_text, "Reflected chat memory is empty."
+                return parsed_text
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_retrieve_plan(self, nodes):
         statements = [
@@ -859,20 +1097,31 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            pattern = [
-                "^\d{1,2}\. (.*)。",
-                "^\d{1,2}\. (.*)",
-                "^\d{1,2}\) (.*)。",
-                "^\d{1,2}\) (.*)",
-            ]
-            return parse_llm_output(response, pattern, mode="match_all")
+        default_failsafe = [r.describe for r in random.choices(nodes, k=5)]
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": [r.describe for r in random.choices(nodes, k=5)],
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    r"^\d{1,2}\.\s*(.*)。?",  # Matches "1. text." or "1. text"
+                    r"^\d{1,2}\)\s*(.*)。?",  # Matches "1) text." or "1) text"
+                    r"^-\s*(.*)。?",        # Matches "- text." or "- text"
+                    r"^(.*)。?",            # Matches "text." or "text" (as a fallback for single lines)
+                ]
+                # mode="match_all" returns a list of strings (first captured group from each match)
+                parsed_plans = parse_llm_output(llm_response_text, patterns, mode="match_all", ignore_empty=True)
+
+                # Filter out any potential empty strings after stripping, if any slip through ignore_empty
+                # and ensure at least one valid plan item exists.
+                processed_plans = [plan.strip() for plan in parsed_plans if plan.strip()]
+
+                assert processed_plans, \
+                       f"Parsed retrieved plans list is empty after processing. Raw: {llm_response_text[:300]}"
+
+                return processed_plans
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_retrieve_thought(self, nodes):
         statements = [
@@ -887,14 +1136,21 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            return response
+        default_failsafe = "{} 应该遵循昨天的日程".format(self.name)
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": "{} 应该遵循昨天的日程".format(self.name),
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                # Thought is often a free-form sentence or paragraph.
+                # We just want to ensure it's not empty if the LLM responds.
+                parsed_thought = llm_response_text.strip()
+
+                assert parsed_thought, "Retrieved thought is empty."
+
+                return parsed_thought
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
 
     def prompt_retrieve_currently(self, plan_note, thought_note):
         time_stamp = (
@@ -913,15 +1169,21 @@ class Scratch:
             }
         )
 
-        def _callback(response):
-            pattern = [
-                "^状态: (.*)。",
-                "^状态: (.*)",
-            ]
-            return parse_llm_output(response, pattern)
+        default_failsafe = self.currently # Original 'currently' status as failsafe
 
-        return {
-            "prompt": prompt,
-            "callback": _callback,
-            "failsafe": self.currently,
-        }
+        def parsing_callback(llm_response_text):
+            try:
+                patterns = [
+                    r"^状态[:：\s]*(.*)。?", # Matches "状态: text." or "状态: text" with optional period
+                    r"^(.*)。?",            # Fallback: matches "text." or "text" if prefix is missing
+                ]
+                # Expects a single string output
+                parsed_currently = parse_llm_output(llm_response_text, patterns, ignore_empty=False)
+
+                assert parsed_currently, "Parsed 'currently' status is empty."
+
+                return parsed_currently.strip() # Return the stripped string
+            except AssertionError:
+                return None # Signal retry
+
+        return {"prompt": prompt, "callback": parsing_callback, "failsafe": default_failsafe}
